@@ -1,0 +1,1402 @@
+'use client';
+
+import { initializeApp } from 'firebase/app';
+import {
+    Firestore,
+    collection,
+    deleteField,
+    doc,
+    getDocs,
+    getFirestore,
+    onSnapshot,
+    query,
+    setDoc,
+    updateDoc,
+    where,
+} from 'firebase/firestore';
+import { ChangeEvent, FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useConfig } from '../hooks/useConfig';
+import { DataContext } from '../hooks/useData';
+import { useWindowParam } from '../hooks/useWindowParam';
+import {
+    DELETED_KEYWORD,
+    IS_DEV,
+    OTHER_KEYWORD,
+    PROCESSING_KEYWORD,
+    REFUND_KEYWORD,
+    TRANSACTIONS_KEYWORD,
+    UPDATING_KEYWORD,
+    WAITING_KEYWORD,
+    USE_DIGICARTE,
+} from '../utils/constants';
+import { getFormattedDate, getTransactionFileName, toSQLDateTime } from '../utils/date';
+import {
+    Currency,
+    Discount,
+    OrderData,
+    OrderItem,
+    Product,
+    ServiceType,
+    SyncAction,
+    SyncPeriod,
+    Transaction,
+    TransactionSet,
+} from '../utils/interfaces';
+import {
+    idbGetTransactions,
+    idbSetTransactions,
+    idbGetAllTransactionSets,
+    idbRemoveTransactions,
+} from '../utils/transactionStore';
+import { mergeTransactionArrays } from './dataProvider/syncUtils';
+import { isProcessingTransaction, isWaitingTransaction } from './dataProvider/transactionHelpers';
+import { useMercurial } from './dataProvider/useMercurial';
+
+enum DatabaseAction {
+    add,
+    update,
+    delete,
+}
+
+enum ConvertAction {
+    none,
+    cloud,
+    local,
+    both,
+}
+
+export interface DataProviderProps {
+    children: ReactNode;
+}
+
+export const DataProvider: FC<DataProviderProps> = ({ children }) => {
+    const { currencies, currencyIndex, setCurrency, parameters } = useConfig();
+    const { isDemo, isOnline } = useWindowParam();
+
+    const [transactionsFilename, setTransactionsFilename] = useState('');
+    const [total, setTotal] = useState(0);
+    const [amount, setAmount] = useState(0);
+    const [quantity, setQuantity] = useState(0);
+    const [currentMercurial, setCurrentMercurial] = useState(parameters.mercurial);
+    const [selectedProduct, setSelectedProduct] = useState<Product>();
+    const products = useRef<Product[]>([]);
+    const [transactions, setTransactions] = useState<Transaction[]>([]);
+    const transactionId = useRef(0);
+    const [firestore, setFirestore] = useState<Firestore>();
+    const areTransactionLoaded = useRef(false);
+    // Set to true by clearTotal to prevent the product-restore effect from re-adding
+    // stale items from PROCESSING transactions when transactions load asynchronously.
+    const clearRequestedRef = useRef(false);
+    const [shopId, setShopId] = useState('');
+    const [orderId, setOrderId] = useState('');
+    const [shortNumOrder, setShortNumOrder] = useState('');
+    const [orderData, setOrderData] = useState<OrderData | null>(null);
+    const [selectedOrderItems, setSelectedOrderItems] = useState<OrderItem[]>([]);
+    const [partialPaymentAmount, setPartialPaymentAmount] = useState(0);
+    const [showPartialPaymentSelector, setShowPartialPaymentSelector] = useState(false);
+    const [counterServiceType, setCounterServiceTypeState] = useState<ServiceType>('sur_place');
+    const [contextTableId, setContextTableId] = useState('');
+    const counterServiceTypeRef = useRef<ServiceType>('sur_place');
+    const setCounterServiceType = useCallback((type: ServiceType) => {
+        counterServiceTypeRef.current = type;
+        setCounterServiceTypeState(type);
+    }, []);
+
+    const isDbConnected = useMemo(() => (USE_DIGICARTE || IS_DEV || !!firestore) && isOnline, [firestore, isOnline]);
+
+    useEffect(() => {
+        setCurrentMercurial(parameters.mercurial);
+    }, [parameters.mercurial]);
+
+    const loadTransactionsFromSQL = useCallback(async (date?: Date) => {
+        try {
+            const dateStr = (date || new Date()).toISOString().split('T')[0];
+            const response = await fetch(`/api/sql/getTransactions?date=${dateStr}&period=day`);
+            if (!response.ok) {
+                const error = await response.json();
+                console.error('SQL DB read error:', error);
+                return null;
+            }
+            const data = await response.json();
+            console.log('SQL DB transactions loaded successfully:', data.transactions?.length || 0);
+            return data.transactions as Transaction[];
+        } catch (error) {
+            console.error('Error loading transactions from SQL DB:', error);
+            return null;
+        }
+    }, []);
+
+    const getLocalTransactions = useCallback(async () => {
+        return idbGetAllTransactionSets(shopId || TRANSACTIONS_KEYWORD);
+    }, [shopId]);
+
+    const setLocalStorageItem = useCallback(async (key: string, transactions: Transaction[]) => {
+        await idbSetTransactions(key, transactions);
+    }, []);
+
+    // Get the LAST occurrence of closing hour (in the past) - this is the cutoff for current day's transactions
+    const getLastResetTime = useCallback(() => {
+        const now = new Date();
+        const reset = new Date();
+        reset.setHours(parameters.closingHour, 0, 0, 0);
+        // If we haven't reached today's closing hour yet, use yesterday's
+        if (now < reset) reset.setDate(reset.getDate() - 1);
+        return reset.getTime();
+    }, [parameters.closingHour]);
+
+    // Compute NEXT reset timestamp (in the future) for scheduling the reset
+    const getNextResetTime = useCallback(() => {
+        const now = new Date();
+        const reset = new Date();
+        reset.setHours(parameters.closingHour, 0, 0, 0);
+        // If we're already past today's closing hour, schedule for tomorrow
+        if (now >= reset) reset.setDate(reset.getDate() + 1);
+        return reset.getTime();
+    }, [parameters.closingHour]);
+
+    useEffect(() => {
+        if (!parameters.shop.name || areTransactionLoaded.current) return;
+
+        // Determine shopId: use 'dev' in dev mode, otherwise use shop.id or URL path
+        const shopId = IS_DEV
+            ? 'dev'
+            : parameters.shop.id || (!USE_DIGICARTE && window.location.pathname.split('/')[1]);
+
+        // Validate shop ID when using SQL database
+        if (!shopId) {
+            console.error('[DataProvider] ERROR: shop.id is required when USE_DIGICARTE is enabled');
+            alert('Configuration Error: Shop ID is missing. Please configure the shop ID in the database parameters.');
+            return;
+        }
+
+        setShopId(shopId);
+        console.log('[DataProvider] Using shopId:', shopId);
+
+        const filename = getTransactionFileName(shopId);
+
+        const loadTransactions = async () => {
+            // Auto-migrate ALL transaction keys from localStorage to IndexedDB
+            const keysToMigrate: string[] = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.split('_')[0] === shopId) {
+                    keysToMigrate.push(key);
+                }
+            }
+
+            if (keysToMigrate.length > 0) {
+                console.log(
+                    `[Migration] Auto-migrating ${keysToMigrate.length} transaction set(s) from localStorage to IndexedDB`
+                );
+                for (const key of keysToMigrate) {
+                    const raw = localStorage.getItem(key);
+                    if (!raw) continue;
+                    try {
+                        const transactions = JSON.parse(raw) as Transaction[];
+                        const existing = await idbGetTransactions(key);
+                        if (existing.length) {
+                            // Merge: keep unique by createdDate, prefer newer modifiedDate
+                            const merged = [...existing];
+                            for (const tx of transactions) {
+                                const idx = merged.findIndex((m) => m.createdDate === tx.createdDate);
+                                if (idx === -1) {
+                                    merged.push(tx);
+                                } else if (tx.modifiedDate > merged[idx].modifiedDate) {
+                                    merged[idx] = tx;
+                                }
+                            }
+                            await idbSetTransactions(key, merged);
+                        } else {
+                            await idbSetTransactions(key, transactions);
+                        }
+                        localStorage.removeItem(key);
+                        console.log(`[Migration] Migrated ${key} (${transactions.length} transactions)`);
+                    } catch (e) {
+                        console.error(`[Migration] Failed to migrate ${key}:`, e);
+                    }
+                }
+            }
+
+            // Load from IndexedDB
+            const localTransactions = await idbGetTransactions(filename);
+
+            // If SQL DB is enabled, merge SQL data into local (latest modifiedDate wins)
+            if (USE_DIGICARTE) {
+                const sqlTransactions = await loadTransactionsFromSQL();
+                if (sqlTransactions?.length) {
+                    const merged = mergeTransactionArrays(localTransactions, sqlTransactions);
+
+                    // Filter transactions: only keep those after the last reset time
+                    const lastResetTime = getLastResetTime();
+                    const currentDayTransactions = merged.filter((tx) => tx.createdDate >= lastResetTime);
+                    const oldTransactions = merged.filter((tx) => tx.createdDate < lastResetTime);
+
+                    // Store old transactions in IndexedDB for historical access
+                    if (oldTransactions.length > 0) {
+                        // Group old transactions by day and store them
+                        const groupedByDay = new Map<string, Transaction[]>();
+                        oldTransactions.forEach((tx) => {
+                            const date = new Date(tx.createdDate);
+                            const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+                            const key = `${shopId}_${dateKey}`;
+                            if (!groupedByDay.has(key)) groupedByDay.set(key, []);
+                            groupedByDay.get(key)!.push(tx);
+                        });
+
+                        // Save each day's transactions to IndexedDB
+                        for (const key of Array.from(groupedByDay.keys())) {
+                            const txs = groupedByDay.get(key)!;
+                            const existing = await idbGetTransactions(key);
+                            const mergedOld = mergeTransactionArrays(existing, txs);
+                            await idbSetTransactions(key, mergedOld);
+                        }
+
+                        console.log(
+                            `[DayReset] Archived ${oldTransactions.length} old transactions into ${groupedByDay.size} day(s)`
+                        );
+                    }
+
+                    // Only show current day's transactions
+                    setLocalStorageItem(filename, currentDayTransactions);
+                    setTransactions(currentDayTransactions);
+                    areTransactionLoaded.current = true;
+                    setTransactionsFilename(filename);
+                    console.log(
+                        'Merged transactions: local=',
+                        localTransactions.length,
+                        'sql=',
+                        sqlTransactions.length,
+                        'current day=',
+                        currentDayTransactions.length,
+                        'archived=',
+                        oldTransactions.length
+                    );
+                    return;
+                }
+            }
+
+            // Filter local transactions by last reset time
+            const lastResetTime = getLastResetTime();
+            const currentDayTransactions = localTransactions.filter((tx) => tx.createdDate >= lastResetTime);
+            setTransactions(currentDayTransactions);
+            areTransactionLoaded.current = true;
+            setTransactionsFilename(filename);
+        };
+
+        loadTransactions();
+    }, [
+        parameters.shop.name,
+        parameters.shop.id,
+        transactionsFilename,
+        loadTransactionsFromSQL,
+        setLocalStorageItem,
+        getLastResetTime,
+    ]);
+
+    const performDayReset = useCallback(() => {
+        console.log('[DayReset] Performing day reset...');
+        areTransactionLoaded.current = false;
+        setTransactionsFilename('');
+        nextResetTime.current = getNextResetTime();
+    }, [getNextResetTime]);
+
+    // Check if reset should happen and perform it
+    const checkAndPerformDayReset = useCallback(() => {
+        if (Date.now() >= nextResetTime.current && areTransactionLoaded.current) {
+            performDayReset();
+            return true;
+        }
+        return false;
+    }, [performDayReset]);
+
+    const nextResetTime = useRef(0);
+
+    // Day reset: setTimeout (primary) + setInterval + visibilitychange (backups)
+    useEffect(() => {
+        if (!parameters.shop.name) return;
+
+        nextResetTime.current = getNextResetTime();
+
+        // Primary: setTimeout to the next reset time
+        const msUntilReset = nextResetTime.current - Date.now();
+        const timeout = setTimeout(performDayReset, msUntilReset);
+
+        // Backup: check every 60s if we've passed the reset time
+        const interval = setInterval(() => {
+            if (Date.now() >= nextResetTime.current) performDayReset();
+        }, 60_000);
+
+        // Backup: check on tab focus (handles device sleep / backgrounded tabs)
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible' && Date.now() >= nextResetTime.current) {
+                performDayReset();
+            }
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
+
+        return () => {
+            clearTimeout(timeout);
+            clearInterval(interval);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+        };
+    }, [parameters.shop.name, getNextResetTime, performDayReset]);
+
+    useEffect(() => {
+        if (IS_DEV || isDemo || USE_DIGICARTE) return;
+
+        fetch(`/api/firebase`)
+            .catch((error) => {
+                console.error(error);
+            })
+            .then((response) => {
+                if (typeof response === 'undefined') return;
+                response.json().then((options) => {
+                    if (!options?.apiKey || !options?.projectId || !options?.appId) return;
+                    const firebaseApp = initializeApp(options);
+                    const firebaseFirestore = getFirestore(firebaseApp);
+                    setFirestore(firebaseFirestore);
+                });
+            });
+    }, [isDemo]);
+
+    const storeIndex = useCallback(
+        async (id: string) => {
+            if (!firestore) return;
+
+            const info = id.split('_');
+            await setDoc(doc(firestore, 'Indexes', id), {
+                shop: !info[0].startsWith(TRANSACTIONS_KEYWORD) ? info[0] : '',
+                date: new Date(info[1]).getTime(),
+            });
+        },
+        [firestore]
+    );
+
+    const storeTransaction = useCallback(
+        (transaction: Transaction) => {
+            setTransactions((previous) => {
+                const next = [...previous];
+                const index = next.findIndex(({ createdDate }) => createdDate === transaction.createdDate);
+
+                if (index >= 0) {
+                    next.splice(index, 1, transaction);
+                } else {
+                    next.unshift(transaction);
+                }
+
+                return next;
+            });
+        },
+        [setTransactions]
+    );
+
+    const convertTransactionsData = useCallback(
+        async (convertAction = ConvertAction.none) => {
+            // CONVERT CLOUD TRANSACTIONS
+            if (convertAction === ConvertAction.cloud || convertAction === ConvertAction.both) {
+                if (!firestore) return;
+                getDocs(collection(firestore, 'Indexes')).then((querySnapshot) => {
+                    querySnapshot.forEach(async (document) => {
+                        const colId = document.id;
+                        await storeIndex(colId);
+
+                        getDocs(collection(firestore, colId)).then((query) => {
+                            query.forEach(async (document) => {
+                                const id = document.id;
+                                await updateDoc(doc(firestore, colId, id), {
+                                    shop: deleteField(),
+                                });
+                            });
+                        });
+                    });
+                });
+            }
+
+            // CONVERT LOCAL TRANSACTIONS
+            if (convertAction === ConvertAction.local || convertAction === ConvertAction.both) {
+                const localTransactionSets = await getLocalTransactions();
+                for (const localTransactionSet of localTransactionSets) {
+                    let id = localTransactionSet.id;
+                    const tx = localTransactionSet.transactions.map((transaction) => {
+                        return {
+                            validator: transaction.validator,
+                            method: transaction.method,
+                            amount: transaction.amount,
+                            createdDate: transaction.createdDate,
+                            modifiedDate: transaction.modifiedDate,
+                            currency:
+                                typeof transaction.currency === 'string'
+                                    ? transaction.currency
+                                    : (transaction.currency as Currency).label,
+                            products: transaction.products,
+                        };
+                    });
+                    if (id.includes('+')) {
+                        await idbRemoveTransactions(id);
+                        id = id.split('+')[1];
+                    }
+                    await setLocalStorageItem(id, tx);
+                }
+            }
+
+            return convertAction === ConvertAction.cloud || convertAction === ConvertAction.both;
+        },
+        [firestore, storeIndex, getLocalTransactions, setLocalStorageItem]
+    );
+
+    const updateLocalTransaction = useCallback(
+        (transactionSet: TransactionSet) => {
+            const txToUpdate = transactionSet.transactions.filter(
+                (transaction) => !isProcessingTransaction(transaction)
+            );
+            // Always persist to IndexedDB (including deleted-flagged transactions)
+            setLocalStorageItem(transactionSet.id, txToUpdate);
+
+            // Update React state if this is the current day's transaction set
+            if (transactionSet.id === transactionsFilename) {
+                const lastResetTime = getLastResetTime();
+                const currentDayTransactions = txToUpdate.filter((tx) => tx.createdDate >= lastResetTime);
+                setTransactions(currentDayTransactions);
+            }
+        },
+        [setLocalStorageItem, transactionsFilename, getLastResetTime]
+    );
+    const updateCloudTransaction = useCallback(
+        async (id: string, transaction: Transaction) => {
+            if (!firestore) return;
+            await setDoc(doc(firestore, id, transaction.createdDate.toString()), transaction);
+        },
+        [firestore]
+    );
+
+    // Check if the "transaction set" in the cloud exists in local (check by "id").
+    // If not add it, if yes, check if every transaction in the cloud transaction set exist in local (check by "createdDate").
+    // If not, add the transaction, if yes, check which one has the biggest "modifiedDate".
+    // If it's the cloud one, update the local, if it's the local one, update the cloud.
+    // Then, check if the "transaction set" in local exists in the cloud, using the same method as above.
+    const fullSync = useCallback(
+        async (cloudTransactionSets: TransactionSet[], syncPeriod: SyncPeriod): Promise<number> => {
+            let localTransactionSets = await getLocalTransactions();
+            let syncedCount = 0;
+
+            console.log(
+                'syncTransactions',
+                'cloud',
+                cloudTransactionSets.sort((a, b) => a.id.localeCompare(b.id)),
+                'local',
+                localTransactionSets.sort((a, b) => a.id.localeCompare(b.id))
+            );
+
+            // Merge cloud → local
+            for (const cloudTransactionSet of cloudTransactionSets) {
+                const localTransactionSet = localTransactionSets.find((set) => set.id === cloudTransactionSet.id);
+
+                if (!localTransactionSet) {
+                    console.log('Added set to local', cloudTransactionSet.id);
+                    updateLocalTransaction(cloudTransactionSet);
+                    syncedCount += cloudTransactionSet.transactions.length;
+                } else {
+                    const updateTransactionSet: TransactionSet = {
+                        id: localTransactionSet.id,
+                        transactions: [...localTransactionSet.transactions],
+                    };
+                    for (const cloudTransaction of cloudTransactionSet.transactions) {
+                        const index = localTransactionSet.transactions.findIndex(
+                            (localTransaction) => localTransaction.createdDate === cloudTransaction.createdDate
+                        );
+
+                        if (index === -1) {
+                            console.log('Added transaction to local', cloudTransaction);
+                            updateTransactionSet.transactions.push(cloudTransaction);
+                            syncedCount++;
+                        } else if (localTransactionSet.id === transactionsFilename) {
+                            const localTransaction = localTransactionSet.transactions[index];
+
+                            if (cloudTransaction.modifiedDate > localTransaction.modifiedDate) {
+                                console.log('Updated transaction in local', cloudTransaction);
+                                updateTransactionSet.transactions.splice(index, 1, cloudTransaction);
+                                syncedCount++;
+                            } else if (firestore && cloudTransaction.modifiedDate < localTransaction.modifiedDate) {
+                                console.log('Updated transaction in cloud', localTransaction);
+                                await updateCloudTransaction(cloudTransactionSet.id, localTransaction);
+                                syncedCount++;
+                            } else if (cloudTransaction.shortNumOrder && !localTransaction.shortNumOrder) {
+                                // Always propagate shortNumOrder from cloud even if no other changes
+                                updateTransactionSet.transactions.splice(index, 1, {
+                                    ...localTransaction,
+                                    shortNumOrder: cloudTransaction.shortNumOrder,
+                                });
+                                syncedCount++;
+                            }
+                        }
+                    }
+                    updateLocalTransaction(updateTransactionSet);
+                }
+            }
+
+            // Merge local → cloud (full sync only, requires Firebase)
+            if (syncPeriod === SyncPeriod.full && firestore) {
+                localTransactionSets = await getLocalTransactions(); // Update local transaction sets after cloud sync
+                for (const localTransactionSet of localTransactionSets) {
+                    const cloudTransactionSet = cloudTransactionSets.find((set) => set.id === localTransactionSet.id);
+
+                    if (!cloudTransactionSet) {
+                        console.log('Added set to cloud', localTransactionSet.id);
+                        await storeIndex(localTransactionSet.id);
+                        for (const localTransaction of localTransactionSet.transactions) {
+                            await updateCloudTransaction(localTransactionSet.id, localTransaction);
+                            syncedCount++;
+                        }
+                    } else {
+                        for (const localTransaction of localTransactionSet.transactions) {
+                            if (
+                                !cloudTransactionSet.transactions.some(
+                                    (cloudTransaction) => cloudTransaction.createdDate === localTransaction.createdDate
+                                )
+                            ) {
+                                console.log('Added transaction to cloud', localTransaction);
+                                await updateCloudTransaction(localTransactionSet.id, localTransaction);
+                                syncedCount++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return syncedCount;
+        },
+        [
+            firestore,
+            storeIndex,
+            getLocalTransactions,
+            transactionsFilename,
+            updateLocalTransaction,
+            updateCloudTransaction,
+        ]
+    );
+
+    const pushTransactionToSQL = useCallback(async (transaction: Transaction, action: 'add' | 'sync' = 'add') => {
+        try {
+            const response = await fetch('/api/sql/saveTransaction', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action,
+                    transaction: {
+                        id: transaction.createdDate,
+                        panier_id: String(transaction.createdDate),
+                        user_id: transaction.validator,
+                        payment_method_id: transaction.method,
+                        amount: transaction.amount,
+                        currency: transaction.currency,
+                        note: '',
+                        created_at: toSQLDateTime(transaction.createdDate),
+                        updated_at: toSQLDateTime(transaction.modifiedDate || transaction.createdDate),
+                        products: transaction.products.map((product) => ({
+                            label: product.label,
+                            category: product.category,
+                            amount: product.amount,
+                            quantity: product.quantity,
+                            discount_amount: product.discount.amount,
+                            discount_unit: product.discount.unit,
+                            total: product.total || 0,
+                        })),
+                    },
+                }),
+            });
+            if (!response.ok) {
+                console.error('Failed to push transaction to SQL:', await response.json());
+            }
+        } catch (error) {
+            console.error('Error pushing transaction to SQL:', error);
+        }
+    }, []);
+
+    const processSyncFromSQL = useCallback(
+        async (syncPeriod: SyncPeriod): Promise<number> => {
+            try {
+                console.log('[SQL Sync] Starting sync with shopId:', shopId);
+                // Include deleted transactions so deletions propagate across devices
+                const response = await fetch(
+                    `/api/sql/getTransactions?period=${syncPeriod === SyncPeriod.day ? 'day' : 'full'}&date=${new Date().toISOString().split('T')[0]}&includeDeleted=true`
+                );
+                if (!response.ok) {
+                    console.error('SQL DB sync error:', await response.json());
+                    return 0;
+                }
+                const data = await response.json();
+                const sqlTransactions = data.transactions as Transaction[];
+                console.log('[SQL Sync] Fetched transactions from SQL:', sqlTransactions.length);
+
+                if (!sqlTransactions.length) {
+                    console.log('[SQL Sync] No transactions to sync');
+                    return 0;
+                }
+
+                // Group SQL transactions by their creation date
+                const groupedByDate = new Map<string, Transaction[]>();
+                sqlTransactions.forEach((tx) => {
+                    const date = new Date(tx.createdDate);
+                    const dateKey = getTransactionFileName(shopId, date);
+                    console.log('[SQL Sync] Transaction dateKey:', dateKey, 'for tx:', tx.createdDate);
+                    if (!groupedByDate.has(dateKey)) groupedByDate.set(dateKey, []);
+                    groupedByDate.get(dateKey)!.push(tx);
+                });
+
+                console.log(
+                    `[SQL Sync] Grouped ${sqlTransactions.length} transactions into ${groupedByDate.size} day(s)`,
+                    Array.from(groupedByDate.keys())
+                );
+
+                // Sync each day's transactions separately
+                for (const dateKey of Array.from(groupedByDate.keys())) {
+                    const dayTransactions = groupedByDate.get(dateKey)!;
+                    const cloudTransactionSets: TransactionSet[] = [
+                        {
+                            id: dateKey,
+                            transactions: dayTransactions,
+                        },
+                    ];
+                    await fullSync(cloudTransactionSets, syncPeriod);
+                    console.log(`[SQL Sync] Synced ${dayTransactions.length} transactions for ${dateKey}`);
+                }
+
+                // Local→SQL push: reconcile local transactions with SQL for current day only
+                const localTransactions = await idbGetTransactions(transactionsFilename);
+                if (localTransactions.length) {
+                    for (const localTx of localTransactions) {
+                        if (isProcessingTransaction(localTx)) continue;
+                        const sqlTx = sqlTransactions.find((s) => s.createdDate === localTx.createdDate);
+                        if (!sqlTx) {
+                            // Local-only → push to SQL
+                            console.log('Pushing local transaction to SQL:', localTx.createdDate);
+                            await pushTransactionToSQL(localTx, 'add');
+                        } else if (localTx.modifiedDate > sqlTx.modifiedDate) {
+                            // Local is newer → update SQL (full replace)
+                            console.log('Updating SQL with newer local transaction:', localTx.createdDate);
+                            await pushTransactionToSQL(localTx, 'sync');
+                        }
+                    }
+                }
+
+                console.log('SQL DB sync completed:', sqlTransactions.length, 'SQL transactions');
+                return sqlTransactions.length;
+            } catch (error) {
+                console.error('Error syncing from SQL DB:', error);
+                return 0;
+            }
+        },
+        [fullSync, transactionsFilename, pushTransactionToSQL, shopId]
+    );
+
+    const processSync = useCallback(
+        async (ids: string | string[], syncPeriod: SyncPeriod): Promise<number> => {
+            // Use SQL DB if enabled
+            if (USE_DIGICARTE) {
+                return await processSyncFromSQL(syncPeriod);
+            }
+
+            if (!firestore) return 0;
+
+            const collectionIds = Array.isArray(ids) ? ids : [ids];
+            let txToProcess = collectionIds.length;
+            console.log('Loaded all collections:', txToProcess);
+
+            return new Promise((resolve) => {
+                const cloudTransactionSets: TransactionSet[] = [];
+                collectionIds.forEach((id) => {
+                    getDocs(collection(firestore, id)).then((query) => {
+                        const transactions = query.docs.map((doc) => doc.data() as Transaction);
+                        if (transactions.length) cloudTransactionSets.push({ id, transactions });
+
+                        console.log('Collections to process:', txToProcess);
+
+                        if (!--txToProcess) {
+                            fullSync(cloudTransactionSets, syncPeriod).then(resolve);
+                        }
+                    });
+                });
+            });
+        },
+        [firestore, fullSync, processSyncFromSQL]
+    );
+
+    const syncTransactions = useCallback(
+        async (period: SyncPeriod, filename = transactionsFilename): Promise<number> => {
+            // For SQL DB, directly use processSync which handles SQL logic
+            if (USE_DIGICARTE) {
+                if (!filename || (await convertTransactionsData(ConvertAction.local))) return 0;
+                return await processSyncFromSQL(period);
+            }
+
+            if (!firestore || !filename || (await convertTransactionsData(ConvertAction.local))) return 0;
+
+            if (period === SyncPeriod.day) {
+                return await processSync(filename, period);
+            } else {
+                return await getDocs(query(collection(firestore, 'Indexes'), where('shop', '==', shopId))).then(
+                    async (querySnapshot) => {
+                        return await processSync(
+                            querySnapshot.docs.map((doc) => doc.id),
+                            period
+                        );
+                    }
+                );
+            }
+        },
+        [convertTransactionsData, firestore, processSync, shopId, transactionsFilename, processSyncFromSQL]
+    );
+
+    useEffect(() => {
+        // For SQL DB mode, only sync transactions without Firebase real-time listener
+        if (USE_DIGICARTE) {
+            if (!transactionsFilename) return;
+            syncTransactions(SyncPeriod.day);
+            return;
+        }
+
+        if (!firestore || !transactionsFilename) return;
+
+        syncTransactions(SyncPeriod.day); // Synchronize the daily transactions on the first load
+
+        const q = query(collection(firestore, transactionsFilename));
+        const unsubscribe = onSnapshot(q, async (querySnapshot) => {
+            // Load the full transaction set from IndexedDB to avoid using filtered state
+            const fullTransactionSet = await idbGetTransactions(transactionsFilename);
+
+            querySnapshot.docChanges().forEach((change) => {
+                // change type can be 'added', 'modified', or 'deleted'
+                const tx = change.doc.data() as Transaction;
+                console.log(change.type, tx);
+
+                const localTx = fullTransactionSet.find((transaction) => transaction.createdDate === tx.createdDate);
+
+                const txToUpdate = [...fullTransactionSet];
+                const updateTx = (txToUpdate: Transaction[]) =>
+                    updateLocalTransaction({ id: transactionsFilename, transactions: txToUpdate });
+                if (!localTx) {
+                    txToUpdate.push(tx as Transaction);
+                    updateTx(txToUpdate);
+                } else {
+                    // TODO : check the transactions modifiedDate
+                    txToUpdate.splice(
+                        txToUpdate.findIndex((transaction) => transaction.createdDate === tx.createdDate),
+                        1,
+                        {
+                            ...tx,
+                            method:
+                                isProcessingTransaction(tx) && !transactionId.current ? UPDATING_KEYWORD : tx.method,
+                        }
+                    );
+                    updateTx(txToUpdate);
+                }
+            });
+        });
+
+        return () => unsubscribe();
+    }, [firestore, transactionsFilename]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const exportTransactions = useCallback(async () => {
+        const localTransactionSets = await getLocalTransactions();
+        const jsonData = JSON.stringify(localTransactionSets);
+
+        // Create a Blob and URL object containing the JSON data
+        const blob = new Blob([jsonData], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+
+        // Create a link element to trigger the download
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'Sauvegarde_' + getFormattedDate() + '.json';
+
+        // Append the link element to the document and trigger the download
+        document.body.appendChild(link);
+        link.click();
+
+        // Clean up the URL and link element
+        URL.revokeObjectURL(url);
+        document.body.removeChild(link);
+    }, [getLocalTransactions]);
+
+    const importTransactions = useCallback(
+        (event?: ChangeEvent<HTMLInputElement>) => {
+            const file = event?.target.files?.[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+
+            reader.onload = (event) => {
+                const jsonData = event.target?.result;
+                if (typeof jsonData === 'string') {
+                    const data = JSON.parse(jsonData);
+
+                    // Store the data in the localStorage
+                    data.forEach((item: { id: string; transactions: Transaction[] }) => {
+                        setLocalStorageItem(item.id, item.transactions);
+                    });
+                }
+            };
+            reader.onerror = (error) => {
+                alert(error);
+            };
+
+            reader.readAsText(file);
+        },
+        [setLocalStorageItem]
+    );
+
+    const processTransactions = useCallback(
+        async (syncAction: SyncAction, date?: Date, event?: ChangeEvent<HTMLInputElement>): Promise<number> => {
+            // Allow processing with SQL DB or Firebase
+            if (!firestore && !USE_DIGICARTE) return 0;
+
+            const filename = date ? getTransactionFileName(shopId, date) : transactionsFilename;
+            switch (syncAction) {
+                case SyncAction.fullsync:
+                    return await syncTransactions(SyncPeriod.full);
+                case SyncAction.daysync:
+                    return await syncTransactions(SyncPeriod.day, filename);
+                case SyncAction.resync:
+                    return await syncTransactions(SyncPeriod.day, filename);
+                case SyncAction.export:
+                    await exportTransactions();
+                    return 0;
+                case SyncAction.import:
+                    importTransactions(event);
+                    return 0;
+            }
+            return 0;
+        },
+        [firestore, syncTransactions, exportTransactions, importTransactions, shopId, transactionsFilename]
+    );
+
+    const saveTransactions = useCallback(
+        async (action: DatabaseAction, transaction: Transaction) => {
+            if (!transaction) return;
+
+            transaction.modifiedDate = transaction.modifiedDate ? new Date().getTime() : transaction.createdDate;
+            transaction.amount = transaction.amount.clean(
+                currencies.find(({ label }) => label === transaction.currency)?.decimals
+            );
+            transaction.validator = parameters.user.name;
+
+            // Build the updated transactions array to save
+            const transactionsToSave = [...transactions];
+            if (action === DatabaseAction.add) {
+                // For new transactions, check if it already exists (by createdDate)
+                const existingIndex = transactionsToSave.findIndex((tx) => tx.createdDate === transaction.createdDate);
+                if (existingIndex >= 0) {
+                    transactionsToSave.splice(existingIndex, 1, transaction);
+                } else {
+                    transactionsToSave.unshift(transaction);
+                }
+            } else {
+                // For update/delete, find and replace the transaction
+                const existingIndex = transactionsToSave.findIndex((tx) => tx.createdDate === transaction.createdDate);
+                if (existingIndex >= 0) {
+                    transactionsToSave.splice(existingIndex, 1, transaction);
+                }
+            }
+
+            // Always persist to localStorage (including deleted-flagged transactions)
+            setLocalStorageItem(transactionsFilename, transactionsToSave);
+
+            const index = transaction.createdDate;
+            transactionId.current = action === DatabaseAction.update ? index : 0;
+
+            if (firestore) {
+                switch (action) {
+                    case DatabaseAction.add:
+                        await storeIndex(transactionsFilename);
+                        await setDoc(doc(firestore, transactionsFilename, index.toString()), transaction);
+                        break;
+                    case DatabaseAction.update:
+                        await updateDoc(doc(firestore, transactionsFilename, index.toString()), {
+                            method: PROCESSING_KEYWORD,
+                        });
+                        break;
+                    case DatabaseAction.delete:
+                        await updateDoc(doc(firestore, transactionsFilename, index.toString()), {
+                            method: DELETED_KEYWORD,
+                        });
+                        break;
+                }
+            }
+
+            if (USE_DIGICARTE) {
+                try {
+                    // Prepare the transaction data for SQL DB
+                    const sqlTransactionData = {
+                        action: DatabaseAction[action],
+                        transaction: {
+                            id: index,
+                            panier_id: orderId || String(transaction.createdDate),
+                            user_id: transaction.validator,
+                            payment_method_id: transaction.method,
+                            amount: transaction.amount,
+                            currency: transaction.currency,
+                            note: '',
+                            created_at: toSQLDateTime(transaction.createdDate),
+                            updated_at: toSQLDateTime(transaction.modifiedDate || transaction.createdDate),
+                            products: transaction.products.map((product) => ({
+                                label: product.label,
+                                category: product.category,
+                                amount: product.amount,
+                                quantity: product.quantity,
+                                discount_amount: product.discount.amount,
+                                discount_unit: product.discount.unit,
+                                total: product.total || 0,
+                            })),
+                        },
+                    };
+
+                    // Call the SQL API endpoint to handle the transaction
+                    const response = await fetch('/api/sql/saveTransaction', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(sqlTransactionData),
+                    });
+
+                    if (!response.ok) {
+                        const error = await response.json();
+                        console.error('SQL DB transaction error:', error);
+                        throw new Error(error.error || 'Failed to save transaction to SQL DB');
+                    }
+
+                    // Notify WebSocket server that the order is complete
+                    // Only send notification for actual payments (not for EN ATTENTE or REMBOURSEMENT)
+                    const isActualPayment =
+                        transaction.method !== WAITING_KEYWORD &&
+                        transaction.method !== REFUND_KEYWORD &&
+                        transaction.method !== DELETED_KEYWORD &&
+                        transaction.method !== PROCESSING_KEYWORD &&
+                        transaction.method !== UPDATING_KEYWORD;
+
+                    if (orderId && isActualPayment) {
+                        try {
+                            await fetch('/api/complete-order', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({ order_id: orderId }),
+                            });
+                        } catch (wsError) {
+                            console.error('Failed to notify WebSocket server:', wsError);
+                            // Don't throw - this is not critical to the transaction
+                        }
+                    } else if (!orderId && isActualPayment && transaction.products.length > 0) {
+                        // Counter order: create panier in DB with short_num_order + broadcast to kitchen
+                        // NOTE: use transaction.products (captured before clearTotal empties products.current)
+                        try {
+                            const counterResponse = await fetch('/api/counter-order', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    products: transaction.products.map((p) => ({
+                                        label: p.label,
+                                        category: p.category,
+                                        quantity: p.quantity,
+                                        options: p.options ?? null,
+                                    })),
+                                    service_type: counterServiceTypeRef.current,
+                                    ...(contextTableId ? { table_id: Number(contextTableId) } : {}),
+                                }),
+                            });
+                            if (counterResponse.ok) {
+                                const counterData = await counterResponse.json();
+                                if (counterData.short_num_order) {
+                                    setShortNumOrder(counterData.short_num_order);
+                                    // Update the already-stored transaction with the order number
+                                    transaction.shortNumOrder = counterData.short_num_order;
+                                    storeTransaction(transaction);
+                                    // Persist shortNumOrder to localStorage (storeTransaction only updates React state)
+                                    setLocalStorageItem(transactionsFilename, transactions);
+                                }
+                            } else {
+                                console.error('counter-order upstream error:', await counterResponse.text());
+                            }
+                        } catch (kitchenError) {
+                            console.error('Failed to send counter order:', kitchenError);
+                            // Non-critical — transaction already saved
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error handling SQL DB transaction:', error);
+                    throw error;
+                }
+            }
+        },
+        [
+            transactionsFilename,
+            transactions,
+            parameters.user,
+            firestore,
+            setLocalStorageItem,
+            currencies,
+            storeIndex,
+            orderId,
+            contextTableId,
+            setShortNumOrder,
+            storeTransaction,
+        ]
+    );
+
+    const deleteTransaction = useCallback(
+        (index?: number) => {
+            if (!transactions.length) return;
+
+            index = index ?? transactions.findIndex(({ createdDate }) => createdDate === transactionId.current);
+
+            if (index >= 0) {
+                const transaction = transactions[index];
+                transaction.method = DELETED_KEYWORD;
+                storeTransaction(transaction);
+                saveTransactions(DatabaseAction.delete, transaction);
+            }
+        },
+        [transactions, saveTransactions, storeTransaction]
+    );
+
+    const toCurrency = useCallback(
+        (element: { amount: number; currency?: string } | number | Product | Transaction) => {
+            const currency =
+                (typeof element !== 'number' && element.hasOwnProperty('currency')
+                    ? currencies.find(({ label }) => label === (element as { currency: string }).currency)
+                    : undefined) ?? currencies[currencyIndex];
+            const amount = element.hasOwnProperty('amount')
+                ? (element as { amount: number }).amount
+                : (element as number);
+            return amount.toCurrency(currency.decimals, currency.symbol);
+        },
+        [currencies, currencyIndex]
+    );
+
+    const { toMercurial, fromMercurial } = useMercurial(currentMercurial);
+
+    const getCurrentTotal = useCallback(() => {
+        return products.current ? products.current.reduce((t, { total }) => t + (total ?? 0), 0) : 0;
+    }, [products]);
+
+    const updateTotal = useCallback(() => {
+        setTotal(getCurrentTotal());
+    }, [getCurrentTotal]);
+
+    const clearAmount = useCallback(() => {
+        setAmount(0);
+        setQuantity(0);
+        setCurrentMercurial(parameters.mercurial);
+        setSelectedProduct(undefined);
+        updateTotal();
+    }, [updateTotal, parameters.mercurial]);
+
+    const clearTotal = useCallback(() => {
+        products.current = [];
+        clearRequestedRef.current = true;
+        deleteTransaction();
+        clearAmount();
+        setShortNumOrder('');
+        setOrderId('');
+    }, [clearAmount, deleteTransaction]);
+
+    const computeDiscount = useCallback((product: Product) => {
+        return product.discount.unit === '%'
+            ? product.amount * (1 - product.discount.amount / 100)
+            : product.amount - product.discount.amount;
+    }, []);
+
+    const setDiscount = useCallback(
+        (product: Product, discount: Discount) => {
+            product.discount = discount;
+            product.total = computeDiscount(product) * toMercurial(product.quantity, product.mercurial);
+            updateTotal();
+        },
+        [updateTotal, computeDiscount, toMercurial]
+    );
+
+    const computeQuantity = useCallback(
+        (product: Product, quantity: number) => {
+            const maxValue = currencies[currencyIndex].maxValue;
+            const quadratic = toMercurial(quantity, product.mercurial);
+            const amount = computeDiscount(product);
+
+            product.quantity =
+                amount * quadratic <= maxValue
+                    ? quantity
+                    : fromMercurial(maxValue / amount, maxValue, product.mercurial);
+            product.total = amount * toMercurial(product.quantity, product.mercurial);
+
+            setQuantity(product.quantity);
+            updateTotal();
+        },
+        [currencies, currencyIndex, toMercurial, fromMercurial, updateTotal, computeDiscount]
+    );
+
+    const addProduct = useCallback(
+        (item?: Product) => {
+            const product = item ?? selectedProduct;
+            if (!product) return;
+
+            const newQuantity = item ? product.quantity : 1;
+
+            if (!product.label && !product.category) return;
+
+            const p = products.current.find(
+                ({ label, category, amount, options }) =>
+                    label === product.label &&
+                    category === product.category &&
+                    amount === product.amount &&
+                    options === product.options
+            );
+            if (p) {
+                computeQuantity(p, newQuantity + p.quantity);
+            } else {
+                products.current.unshift(product);
+                computeQuantity(product, newQuantity);
+            }
+
+            setSelectedProduct(p ?? product);
+            setAmount(product.amount);
+            setQuantity(product.amount ? -1 : 0);
+        },
+        [products, selectedProduct, computeQuantity]
+    );
+
+    const deleteProduct = useCallback(
+        (index: number) => {
+            if (!products.current.length || !products.current.at(index)) return;
+
+            products.current.splice(index, 1).at(0);
+
+            if (!products.current.length) {
+                deleteTransaction();
+            }
+
+            clearAmount();
+        },
+        [products, clearAmount, deleteTransaction]
+    );
+
+    const removeProduct = useCallback(
+        (item?: Product) => {
+            const product = item ?? {
+                category: selectedProduct?.category,
+                label: selectedProduct?.label,
+                amount: selectedProduct?.amount,
+            };
+            const p = products.current.find(
+                ({ label, category, amount }) =>
+                    label === product.label && category === product.category && amount === product.amount
+            );
+
+            if (!p) return;
+
+            if (p.quantity <= 1) {
+                deleteProduct(products.current.indexOf(p));
+            } else {
+                computeQuantity(p, p.quantity - 1);
+            }
+        },
+        [selectedProduct, products, computeQuantity, deleteProduct]
+    );
+
+    const displayProduct = useCallback(
+        (product: Product, currency?: string) => {
+            const name = product.label && product.label !== OTHER_KEYWORD ? product.label : product.category;
+            const priceUnit = toCurrency({ amount: product.amount, currency });
+            const discountSuffix = product.discount.amount
+                ? ' (-' + product.discount.amount + product.discount.unit + ')'
+                : '';
+            const priceSuffix =
+                product.quantity === 1
+                    ? ` : ${priceUnit}${discountSuffix}`
+                    : ` : ${priceUnit} x ${product.quantity} = ${toCurrency({ amount: product.total ?? 0, currency })}${discountSuffix}`;
+
+            if (product.options) {
+                try {
+                    const parsed: { type: string; valeur: string; prix: number }[] = JSON.parse(product.options);
+                    // Formula product: elements stored with type === 'element'
+                    if (parsed.length > 0 && parsed[0].type === 'element') {
+                        const elementLines = parsed.map((o) => `  · ${o.valeur}`).join('\n');
+                        return `${name}${priceSuffix}\n${elementLines}`;
+                    }
+                    // Regular product with paid/free options
+                    const parts = parsed.map((o) =>
+                        o.prix > 0 && o.prix !== product.amount
+                            ? `${o.valeur} (+${toCurrency({ amount: o.prix, currency })})`
+                            : o.valeur
+                    );
+                    if (parts.length > 0) {
+                        return `${name} [${parts.join(', ')}]${priceSuffix}`;
+                    }
+                } catch {
+                    // ignore
+                }
+            }
+            return `${name}${priceSuffix}`;
+        },
+        [toCurrency]
+    );
+
+    useEffect(() => {
+        // If clearTotal was recently called, don't restore a stale PROCESSING transaction.
+        // Keep blocking until the processing transaction is actually gone from state.
+        if (clearRequestedRef.current) {
+            const processingStillExists = transactions.some(
+                (t) => isProcessingTransaction(t) && t.validator === parameters.user.name
+            );
+            if (!processingStillExists) clearRequestedRef.current = false;
+            return;
+        }
+        const processingTransaction = !products.current.length
+            ? transactions.find(
+                  (transaction) =>
+                      isProcessingTransaction(transaction) && transaction.validator === parameters.user.name
+              )
+            : undefined;
+        if (processingTransaction) {
+            transactionId.current = processingTransaction.createdDate;
+            processingTransaction.products.forEach(addProduct);
+        }
+    }, [transactions, parameters.user, addProduct]);
+
+    const editTransaction = useCallback(
+        (index: number) => {
+            const transaction = transactions.at(index);
+            if (!transaction?.amount) return;
+
+            setCurrency(transaction.currency);
+            transaction.products.forEach(addProduct);
+            transaction.method = PROCESSING_KEYWORD;
+
+            saveTransactions(DatabaseAction.update, transaction);
+        },
+        [transactions, saveTransactions, addProduct, setCurrency]
+    );
+
+    const updateTransaction = useCallback(
+        (item: string | Transaction) => {
+            if (!item || (typeof item === 'string' && !products.current.length)) return;
+
+            const currentTime = new Date().getTime();
+            const transaction: Transaction =
+                typeof item === 'object'
+                    ? item
+                    : {
+                          validator: parameters.user.name,
+                          method: item,
+                          amount: getCurrentTotal(),
+                          createdDate: transactionId.current || currentTime,
+                          modifiedDate: transactionId.current,
+                          currency: currencies[currencyIndex].label,
+                          products: products.current,
+                          ...(shortNumOrder ? { shortNumOrder } : {}),
+                      };
+
+            storeTransaction(transaction);
+            saveTransactions(DatabaseAction.add, transaction);
+
+            clearTotal();
+        },
+        [
+            clearTotal,
+            products,
+            saveTransactions,
+            getCurrentTotal,
+            currencies,
+            currencyIndex,
+            storeTransaction,
+            parameters,
+            shortNumOrder,
+        ]
+    );
+
+    const reverseTransaction = useCallback(
+        (transaction: Transaction): Transaction => {
+            const reversedProducts = transaction.products.map((product) => {
+                const reversedProduct = { ...product };
+                // Use computeQuantity with negative quantity to properly calculate reversed values
+                computeQuantity(reversedProduct, -product.quantity);
+                return reversedProduct;
+            });
+
+            return {
+                ...transaction,
+                amount: -transaction.amount,
+                products: reversedProducts,
+            };
+        },
+        [computeQuantity]
+    );
+
+    const displayTransaction = useCallback(
+        (transaction: Transaction) => {
+            if (!transaction.modifiedDate || !transaction.method) return '';
+            return (
+                toCurrency(transaction) +
+                (isWaitingTransaction(transaction) ? ' ' : ' en ') +
+                transaction.method +
+                ' à ' +
+                new Date(transaction.modifiedDate).toTimeString().slice(0, 9)
+            );
+        },
+        [toCurrency]
+    );
+
+    return (
+        <DataContext.Provider
+            value={{
+                total,
+                getCurrentTotal,
+                amount,
+                setAmount,
+                quantity,
+                setQuantity,
+                computeQuantity,
+                setDiscount,
+                toMercurial,
+                setCurrentMercurial,
+                selectedProduct,
+                setSelectedProduct,
+                addProduct,
+                removeProduct,
+                deleteProduct,
+                displayProduct,
+                clearAmount,
+                clearTotal,
+                products,
+                transactions,
+                processTransactions,
+                updateTransaction,
+                editTransaction,
+                deleteTransaction,
+                displayTransaction,
+                reverseTransaction,
+                transactionsFilename,
+                toCurrency,
+                isDbConnected,
+                orderId,
+                setOrderId,
+                shortNumOrder,
+                setShortNumOrder,
+                orderData,
+                setOrderData,
+                selectedOrderItems,
+                setSelectedOrderItems,
+                partialPaymentAmount,
+                setPartialPaymentAmount,
+                showPartialPaymentSelector,
+                setShowPartialPaymentSelector,
+                counterServiceType,
+                setCounterServiceType,
+                contextTableId,
+                setContextTableId,
+                checkAndPerformDayReset,
+            }}
+        >
+            {children}
+        </DataContext.Provider>
+    );
+};

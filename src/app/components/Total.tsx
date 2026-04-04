@@ -1,0 +1,679 @@
+'use client';
+
+import { FC, MouseEventHandler, useCallback, useMemo, useState } from 'react';
+import { twMerge } from 'tailwind-merge';
+import {
+    isConfirmedTransaction,
+    isDeletedTransaction,
+    isUpdatingTransaction,
+    isWaitingTransaction,
+} from '../contexts/dataProvider/transactionHelpers';
+import { useConfig } from '../hooks/useConfig';
+import { useData } from '../hooks/useData';
+import { usePay } from '../hooks/usePay';
+import { usePopup } from '../hooks/usePopup';
+import { useSummary } from '../hooks/useSummary';
+import { useWindowParam } from '../hooks/useWindowParam';
+import Loading, { LoadingType } from '../loading';
+import { BACK_KEYWORD, REFUND_KEYWORD, UPDATING_KEYWORD, USE_DIGICARTE, WAITING_KEYWORD } from '../utils/constants';
+import { OrderItem, State, Transaction } from '../utils/interfaces';
+import { CLOSE, postMessageToParent } from '../utils/message';
+import { isMobileSize, useIsMobile, useIsMobileDevice } from '../utils/mobile';
+import { Amount } from './Amount';
+import { CloseButton } from './CloseButton';
+import TradizTopNav from './admin/TradizTopNav';
+import { OrderItemsSelector } from './OrderItemsSelector';
+import { useAddPopupClass } from './Popup';
+
+const payLabel = 'PAYER';
+const totalLabel = 'TOTAL';
+
+interface ItemProps {
+    className?: string;
+    label: string;
+    onClick?: () => void;
+    onContextMenu: () => void;
+}
+
+interface Option {
+    label: string;
+    action: (index: number) => void;
+}
+
+function handleContextMenu(
+    title: string,
+    options: Option[],
+    index: number,
+    openPopup: (
+        title: string,
+        options: string[],
+        callback: (index: number, option: string) => void,
+        isCloseable: boolean
+    ) => void
+) {
+    if (index >= 0) {
+        openPopup(
+            title,
+            options.map(({ label }) => label),
+            (i) => i >= 0 && options[i].action(index),
+            true
+        );
+    }
+}
+
+const Item: FC<ItemProps> = ({ label, onClick = () => {}, onContextMenu, className }) => {
+    const handleContextMenu = useCallback<MouseEventHandler>(
+        (e) => {
+            e.preventDefault();
+            onContextMenu();
+        },
+        [onContextMenu]
+    );
+
+    const lines = label.split('\n');
+    return (
+        <div className={twMerge('text-left pl-3', className)} onClick={onClick} onContextMenu={handleContextMenu}>
+            {lines.map((line, i) => (
+                <div key={i}>{line}</div>
+            ))}
+        </div>
+    );
+};
+
+export const Total: FC<{ showLightAdminNav?: boolean }> = ({ showLightAdminNav = false }) => {
+    const isMobileDevice = useIsMobileDevice();
+    const [navExpanded, setNavExpanded] = useState(false);
+    const {
+        total,
+        getCurrentTotal,
+        amount,
+        selectedProduct,
+        transactions,
+        editTransaction,
+        deleteTransaction,
+        displayTransaction,
+        reverseTransaction,
+        toCurrency,
+        products,
+        setSelectedProduct,
+        setAmount,
+        setQuantity,
+        deleteProduct,
+        displayProduct,
+        updateTransaction,
+        orderId,
+        setSelectedOrderItems,
+        setPartialPaymentAmount,
+        showPartialPaymentSelector,
+        setShowPartialPaymentSelector,
+    } = useData();
+    const { showTransactionsSummary, showTransactionsSummaryMenu } = useSummary();
+    const { openPopup, closePopup } = usePopup();
+    const { pay, printTransaction } = usePay();
+    const { state, isStateReady, getPrintersNames, modeFonctionnement } = useConfig();
+
+    const [needRefresh, setNeedRefresh] = useState(false);
+    const visibleTransactions = useMemo(() => transactions.filter((tx) => !isDeletedTransaction(tx)), [transactions]);
+
+    const label = useIsMobile() ? totalLabel : payLabel;
+
+    // Helper function to edit transaction, reversing refund transactions first
+    const editTransactionWithReversal = useCallback(
+        (index: number) => {
+            const transaction = transactions.at(index);
+            if (!transaction) return;
+
+            // If it's a refund transaction, reverse it first
+            if (transaction.method === REFUND_KEYWORD) {
+                const reversedTransaction = reverseTransaction(transaction);
+                // Replace the transaction in the array with the reversed one
+                transactions.splice(index, 1, reversedTransaction);
+            }
+
+            // Now call editTransaction normally
+            editTransaction(index);
+        },
+        [transactions, reverseTransaction, editTransaction]
+    );
+
+    const getTransactionMenu = useCallback(
+        (transaction: Transaction | undefined, fallback: (index: number) => void) => {
+            if (!transaction || !isStateReady || isUpdatingTransaction(transaction)) return;
+
+            const isWaiting = isWaitingTransaction(transaction);
+            return {
+                title: 'Transaction',
+                options: [
+                    {
+                        label: isWaiting ? 'Payer' : 'Modifier Paiement',
+                        action: (index: number) => {
+                            editTransactionWithReversal(index); // set the transaction as current
+                            setTimeout(pay, 100);
+                        },
+                    },
+                    {
+                        label: isWaiting ? 'Reprendre' : 'Modifier Produits',
+                        action: (index: number) => {
+                            editTransactionWithReversal(index);
+                            closePopup();
+                        },
+                    },
+                ]
+                    .concat(
+                        getPrintersNames().map((printerName) => ({
+                            label: printerName,
+                            action: () => printTransaction(printerName, transaction),
+                        }))
+                    )
+                    .concat([
+                        {
+                            label: 'Effacer',
+                            action: (index: number) => {
+                                deleteTransaction(index);
+                                closePopup();
+                            },
+                        },
+                        {
+                            label: 'Annuler',
+                            action: (index: number) => fallback(index),
+                        },
+                    ]),
+            };
+        },
+        [
+            editTransactionWithReversal,
+            isStateReady,
+            deleteTransaction,
+            pay,
+            printTransaction,
+            closePopup,
+            getPrintersNames,
+        ]
+    );
+
+    const selectProduct = useCallback(
+        (index: number) => {
+            if (!isStateReady && index >= 0) return;
+
+            const newSelectedProduct =
+                products.current.at(index) === selectedProduct ? undefined : products.current.at(index);
+
+            setSelectedProduct(newSelectedProduct);
+            setAmount(newSelectedProduct?.amount ?? 0);
+            setQuantity(newSelectedProduct?.amount ? -1 : 0);
+        },
+        [products, selectedProduct, setSelectedProduct, isStateReady, setAmount, setQuantity]
+    );
+
+    const modifyProduct = useCallback(
+        (index: number) => {
+            if (!isStateReady && index >= 0) return;
+
+            handleContextMenu(
+                'Effacer ?',
+                [
+                    {
+                        label: 'Oui',
+                        action: (index) => deleteProduct(index),
+                    },
+                    {
+                        label: 'Non',
+                        action: () => closePopup(),
+                    },
+                ],
+                index,
+                openPopup
+            );
+        },
+        [deleteProduct, openPopup, closePopup, isStateReady]
+    );
+
+    const modifyTransaction = useCallback(
+        (index: number, fallback: (index: number) => void) => {
+            const transaction = index >= 0 ? transactions.at(index) : undefined;
+            const transactionMenu = getTransactionMenu(transaction, fallback);
+            if (!transactionMenu) return;
+
+            handleContextMenu(transactionMenu.title, transactionMenu.options, index, openPopup);
+        },
+        [getTransactionMenu, openPopup, transactions]
+    );
+
+    const displayTransactionsTitle = useCallback(() => {
+        if (!visibleTransactions.length) return '';
+
+        const totalTransactions = visibleTransactions.length;
+        const currencies: { [key: string]: { amount: number; currency: string } } = {};
+        visibleTransactions.forEach((transaction) => {
+            if (currencies[transaction.currency]) {
+                currencies[transaction.currency].amount += transaction.amount;
+            } else {
+                currencies[transaction.currency] = {
+                    amount: transaction.amount,
+                    currency: transaction.currency,
+                };
+            }
+        });
+
+        return `${totalTransactions} vente${totalTransactions > 1 ? 's' : ''} : ${Object.values(currencies)
+            .map((element) => {
+                return `${toCurrency(element)}`;
+            })
+            .join(' + ')}`;
+    }, [toCurrency, visibleTransactions]);
+
+    const showProducts = useCallback(() => {
+        if (!products.current.length) return;
+
+        const printerOptions = getPrintersNames();
+
+        openPopup(
+            products.current.length + ' produits : ' + toCurrency(getCurrentTotal()),
+            products.current
+                .map((product) => displayProduct(product))
+                .concat(printerOptions)
+                .concat(['', payLabel]),
+            (index, option) => {
+                if (option === payLabel) {
+                    pay();
+                } else if (printerOptions.includes(option)) {
+                    // Handle print option - create a temporary transaction to print
+                    printTransaction(option);
+                } else if (index >= 0) {
+                    closePopup(() => selectProduct(index));
+                }
+            },
+            true,
+            (index) => {
+                const totalOptions = products.current.length + printerOptions.length + 1; // +1 for empty line
+                if (index >= totalOptions) {
+                    pay();
+                } else if (index < products.current.length) {
+                    openPopup(
+                        'Effacer ?',
+                        ['Oui', 'Non'],
+                        (i) => {
+                            if (i === 0) {
+                                deleteProduct(index);
+                                if (products.current.length) {
+                                    showProducts();
+                                } else {
+                                    closePopup();
+                                }
+                            } else {
+                                showProducts();
+                            }
+                        },
+                        true
+                    );
+                }
+            },
+            (option) => Boolean(selectedProduct && option === displayProduct(selectedProduct))
+        );
+    }, [
+        getCurrentTotal,
+        pay,
+        products,
+        openPopup,
+        closePopup,
+        displayProduct,
+        deleteProduct,
+        toCurrency,
+        selectProduct,
+        selectedProduct,
+        getPrintersNames,
+        printTransaction,
+    ]);
+
+    const deleteBoughtProduct = useCallback(
+        (
+            productIndex: number,
+            transactionIndex: number,
+            transaction: Transaction,
+            backToProducts: () => void,
+            backToTransactions: () => void
+        ) => {
+            if (!visibleTransactions.length) return;
+
+            transaction.products.splice(productIndex, 1);
+            transaction.amount = transaction.products.reduce(
+                (total, product) => total + product.amount * product.quantity,
+                0
+            );
+            if (!transaction.amount) {
+                deleteTransaction(transactionIndex);
+                if (visibleTransactions.length) {
+                    backToTransactions();
+                } else {
+                    closePopup();
+                }
+                setNeedRefresh(true);
+            } else {
+                updateTransaction(transaction);
+                backToProducts();
+            }
+        },
+        [visibleTransactions, closePopup, updateTransaction, deleteTransaction]
+    );
+
+    const showBoughtProducts = useCallback(
+        (transactionIndex: number, fallback: () => void) => {
+            const transaction = transactionIndex >= 0 ? transactions.at(transactionIndex) : undefined;
+            if (isUpdatingTransaction(transaction) || !transaction?.amount || !isStateReady) return;
+
+            openPopup(
+                toCurrency(transaction) +
+                    ' en ' +
+                    transaction.method +
+                    (transaction.shortNumOrder ? ` [#${transaction.shortNumOrder}]` : ''),
+
+                transaction.products
+                    .map((product) => displayProduct(product, transaction.currency))
+                    .concat(isMobileSize() ? ['', BACK_KEYWORD] : []),
+                (i, o) =>
+                    o === BACK_KEYWORD
+                        ? fallback()
+                        : modifyTransaction(i !== -1 ? transactionIndex : i, (i) => showBoughtProducts(i, fallback)),
+                true,
+                (productIndex) => {
+                    openPopup(
+                        'Effacer ?',
+                        ['Oui', 'Non'],
+                        (i) => {
+                            if (i === 0) {
+                                deleteBoughtProduct(
+                                    productIndex,
+                                    transactionIndex,
+                                    transaction,
+                                    () => showBoughtProducts(transactionIndex, fallback),
+                                    fallback
+                                );
+                            } else {
+                                showBoughtProducts(transactionIndex, fallback);
+                            }
+                        },
+                        true
+                    );
+                }
+            );
+        },
+        [transactions, openPopup, displayProduct, toCurrency, modifyTransaction, isStateReady, deleteBoughtProduct]
+    );
+
+    const sortedTransactions = useMemo(() => {
+        if (!transactions.length) return [];
+
+        const waitingTransactions = transactions
+            .filter(isWaitingTransaction)
+            .sort((a, b) => b.createdDate - a.createdDate);
+        const confirmedTransactions = transactions
+            .filter(isConfirmedTransaction)
+            .sort((a, b) => b.createdDate - a.createdDate);
+        const hasSeparation = waitingTransactions.length && confirmedTransactions.length;
+        return waitingTransactions.concat(hasSeparation ? [{} as Transaction] : []).concat(confirmedTransactions);
+    }, [transactions]);
+
+    const getTransactionIndex = useCallback(
+        (index: number) =>
+            transactions.findIndex((transaction) => transaction.createdDate === sortedTransactions[index]?.createdDate),
+        [sortedTransactions, transactions]
+    );
+
+    const showTransactions = useCallback(() => {
+        if (!visibleTransactions.length) return;
+
+        openPopup(
+            displayTransactionsTitle(),
+            sortedTransactions.map(displayTransaction),
+            (i) => showBoughtProducts(getTransactionIndex(i), showTransactions),
+            true,
+            (index) => {
+                const transactionMenu = getTransactionMenu(sortedTransactions.at(index), () => showTransactions());
+                if (!transactionMenu) return;
+
+                openPopup(
+                    transactionMenu.title,
+                    transactionMenu.options.map(({ label }) => label),
+                    (i) => {
+                        if (i >= 0) {
+                            transactionMenu.options[i].action(index);
+                        }
+                    }
+                );
+            },
+            (option) => option.includes(WAITING_KEYWORD) || option.includes(UPDATING_KEYWORD)
+        );
+    }, [
+        openPopup,
+        visibleTransactions,
+        displayTransaction,
+        showBoughtProducts,
+        displayTransactionsTitle,
+        getTransactionIndex,
+        sortedTransactions,
+        getTransactionMenu,
+    ]);
+
+    const canDisplayTotal = useMemo(() => {
+        setNeedRefresh(false);
+        return Boolean(needRefresh || total || amount || selectedProduct || !visibleTransactions.length);
+    }, [total, amount, selectedProduct, visibleTransactions, needRefresh]);
+
+    const handleClick = useCallback<MouseEventHandler>(
+        (e) => {
+            e.preventDefault();
+
+            if (!isStateReady) return;
+
+            if (canDisplayTotal) {
+                if (isMobileSize()) {
+                    showProducts();
+                } else {
+                    pay();
+                }
+            } else if (visibleTransactions.length) {
+                if (isMobileSize()) {
+                    showTransactions();
+                } else {
+                    if (e.type === 'click') {
+                        showTransactionsSummary(showTransactionsSummaryMenu);
+                    } else {
+                        showTransactionsSummaryMenu();
+                    }
+                }
+            }
+        },
+        [
+            showProducts,
+            showTransactions,
+            canDisplayTotal,
+            visibleTransactions,
+            pay,
+            showTransactionsSummary,
+            showTransactionsSummaryMenu,
+            isStateReady,
+        ]
+    );
+
+    const clickClassName = twMerge(
+        'active:bg-secondary-active-light dark:active:bg-secondary-active-dark active:text-popup-dark dark:active:text-popup-light',
+        isStateReady && !isMobileDevice ? 'hover:bg-active-light dark:hover:bg-active-dark cursor-pointer' : ''
+    );
+
+    const { width: screenWidth, height: screenHeight } = useWindowParam();
+    const left = useMemo(() => (!isMobileSize() && screenWidth > 0 ? screenWidth / 2 : 0), [screenWidth]);
+    const height = useMemo(() => (!isMobileSize() && screenHeight > 0 ? screenHeight - 76 : 0), [screenHeight]);
+
+    // Handler for order items selection change
+    const handleOrderItemsChange = useCallback(
+        (selectedItems: OrderItem[], totalAmount: number) => {
+            setSelectedOrderItems(selectedItems);
+            setPartialPaymentAmount(totalAmount);
+        },
+        [setSelectedOrderItems, setPartialPaymentAmount]
+    );
+
+    // Call all hooks BEFORE any conditional return
+    const popupClass = useAddPopupClass(
+        'inset-x-0 h-[75px] md:absolute md:left-1/2 md:h-full md:border-l-4 overflow-hidden ' +
+            'md:border-secondary-active-light md:dark:border-secondary-active-dark '
+    );
+    const popupClassNormal = useAddPopupClass(
+        'inset-x-0 h-[75px] md:absolute md:left-1/2 md:h-full md:border-l-4 overflow-y-auto ' +
+            'md:border-secondary-active-light md:dark:border-secondary-active-dark '
+    );
+    const isMobile = useIsMobile();
+
+    // Show loading animation while state is init, loading, or error (after all hooks are called)
+    if (state === State.init || state === State.loading || state === State.error) {
+        return (
+            <div className={popupClass} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {Loading(LoadingType.Dot, false)}
+            </div>
+        );
+    }
+
+    // If showPartialPaymentSelector is true, show the OrderItemsSelector instead of normal view
+    if (showPartialPaymentSelector && orderId) {
+        return (
+            <div className={popupClass}>
+                <div className="md:w-1/2 w-full fixed py-3 px-3 border-b-4 border-active-light dark:border-active-dark bg-blue-100 dark:bg-blue-900">
+                    <div className="flex items-center gap-2">
+                        <button
+                            onClick={() => {
+                                setShowPartialPaymentSelector(false);
+                                setSelectedOrderItems([]);
+                                setPartialPaymentAmount(0);
+                            }}
+                            className="shrink-0 text-xs md:text-sm px-2 md:px-3 py-1 md:py-2 bg-red-500 text-white rounded hover:bg-red-600"
+                        >
+                            {BACK_KEYWORD}
+                        </button>
+                        <span className="text-base md:text-lg font-bold truncate">Paiement Partiel</span>
+                    </div>
+                </div>
+                <div
+                    className="md:w-1/2 fixed top-[65px] md:top-[73px] left-0 w-full overflow-hidden"
+                    style={{ left: left, height: height - 19 }}
+                >
+                    <OrderItemsSelector orderId={orderId} onSelectionChange={handleOrderItemsChange} />
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className={popupClassNormal}>
+            <div
+                className={twMerge(
+                    'md:w-1/2 w-full fixed text-5xl text-center font-bold py-3',
+                    'border-b-4 border-active-light dark:border-active-dark',
+                    isMobile ? 'md:hidden' : 'hidden md:block'
+                )}
+            >
+                <div className="flex items-center gap-0 w-full">
+                    {showLightAdminNav && isMobile && (
+                        <div onClick={(e) => e.stopPropagation()}>
+                            <TradizTopNav inline onCollapsedChange={(c) => setNavExpanded(!c)} />
+                        </div>
+                    )}
+                    <div
+                        className={twMerge(
+                            'flex-1 text-center overflow-hidden',
+                            (canDisplayTotal && total) || (!canDisplayTotal && visibleTransactions.length)
+                                ? clickClassName
+                                : ''
+                        )}
+                        onClick={handleClick}
+                        onContextMenu={handleClick}
+                    >
+                        {canDisplayTotal ? (
+                            <span>
+                                {!navExpanded && (canDisplayTotal && total ? label : totalLabel)}{' '}
+                                <Amount value={total} showZero />
+                            </span>
+                        ) : (
+                            <span>
+                                {!navExpanded && 'Ticket : '}
+                                {visibleTransactions.length}
+                                <span className="text-xl">{`vente${(visibleTransactions.length ?? 0) > 1 ? 's' : ''}`}</span>
+                            </span>
+                        )}
+                    </div>
+                    {USE_DIGICARTE && modeFonctionnement !== 'lite' && (
+                        <CloseButton
+                            onClose={() => postMessageToParent(CLOSE)}
+                            className="pt-0 active:bg-light dark:active:bg-dark text-light dark:text-dark"
+                            size="xl"
+                        />
+                    )}
+                </div>
+            </div>
+
+            <div
+                className={
+                    'md:w-1/2 fixed top-[76px] left-0 w-1/2 text-center text-2xl ' +
+                    'font-bold hidden md:flex md:flex-col'
+                }
+                style={{ left: left, height: height }}
+            >
+                <div className="flex-1 overflow-y-auto">
+                    {canDisplayTotal
+                        ? products.current
+                              .map((product) => ({
+                                  product: displayProduct(product),
+                                  isSelectedProduct: product === selectedProduct,
+                              }))
+                              .map(({ product, isSelectedProduct }, index) => (
+                                  <Item
+                                      className={twMerge(
+                                          'py-2 ml-1',
+                                          clickClassName,
+                                          isSelectedProduct ? 'animate-pulse' : ''
+                                      )}
+                                      key={index}
+                                      label={product}
+                                      onClick={() => selectProduct(index)}
+                                      onContextMenu={() => modifyProduct(index)}
+                                  />
+                              ))
+                        : sortedTransactions
+                              .map((transaction) => ({
+                                  transaction: displayTransaction(transaction),
+                                  isWaitingTransaction: isWaitingTransaction(transaction),
+                                  isUpdatingTransaction: isUpdatingTransaction(transaction),
+                              }))
+                              .map(({ transaction, isWaitingTransaction, isUpdatingTransaction }, index) =>
+                                  transaction ? (
+                                      <Item
+                                          className={twMerge(
+                                              'py-2 ml-1',
+                                              isWaitingTransaction || isUpdatingTransaction ? 'animate-pulse' : '',
+                                              isUpdatingTransaction ? 'cursor-not-allowed' : clickClassName
+                                          )}
+                                          key={index}
+                                          label={transaction}
+                                          onClick={() =>
+                                              showBoughtProducts(getTransactionIndex(index), () => closePopup())
+                                          }
+                                          onContextMenu={() =>
+                                              modifyTransaction(getTransactionIndex(index), () => closePopup())
+                                          }
+                                      />
+                                  ) : (
+                                      <div
+                                          key={index}
+                                          className="border-b-2 border-secondary-active-light dark:border-secondary-active-dark"
+                                      />
+                                  )
+                              )}
+                </div>
+                {!canDisplayTotal && (
+                    <div className="shrink-0 pt-1 border-t-4 border-secondary-active-light dark:border-secondary-active-dark bg-primary-light dark:bg-primary-dark">
+                        {displayTransactionsTitle()}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
