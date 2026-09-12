@@ -41,7 +41,7 @@ export async function GET() {
             values: [],
             options: [],
         };
-        data.values.push(['Taux', 'Catégorie', 'Nom', 'Indisponible', 'Euro (€)']);
+        data.values.push(['Taux', 'Catégorie', 'Nom', 'Indisponible', 'Dinar (DA)']);
         data.values.push(
             ...allRows.map((row): (number | string | boolean)[] => [
                 Number(row.rate) / 100,
