@@ -20,8 +20,12 @@ export const TRANSACTION_TIME_OUT = 60; // Time out in seconds
 export const IS_LOCAL = !process.env.NEXT_PUBLIC_VERCEL_ENV;
 export const IS_DEV = process.env.NEXT_PUBLIC_IS_DEV?.toLowerCase() === 'true';
 export const SHOP_ID = process.env.NEXT_PUBLIC_SHOP_ID || '';
-export const USE_DIGICARTE = process.env.NEXT_PUBLIC_USE_DIGICARTE?.toLowerCase() === 'true';
-export const WEB_URL = process.env.NEXT_PUBLIC_WEB_URL || '';
+// Support des deux préfixes : NEXT_PUBLIC_* (build Next.js standard, valeur
+// exposée au navigateur) et NEXT_CONFIG_* (variante définie dans Vercel).
+export const USE_DIGICARTE =
+    (process.env.NEXT_PUBLIC_USE_DIGICARTE ?? process.env.NEXT_CONFIG_USE_DIGICARTE)?.toLowerCase() === 'true';
+export const WEB_URL =
+    process.env.NEXT_PUBLIC_WEB_URL || process.env.NEXT_CONFIG_WEB_URL || '';
 
 // Solana
 export const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
