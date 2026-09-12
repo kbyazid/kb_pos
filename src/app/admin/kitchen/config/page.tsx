@@ -7,7 +7,6 @@ import SectionCard from '@/app/components/admin/SectionCard';
 import ValidatedInput from '@/app/components/admin/ValidatedInput';
 import { Discount, Mercurial } from '@/app/utils/interfaces';
 import { defaultParameters } from '@/app/utils/processData';
-import { USE_DIGICARTE } from '@/app/utils/constants';
 import AdminPageLayout from '@/app/components/admin/AdminPageLayout';
 import AdminLabel from '@/app/components/admin/AdminLabel';
 import DiscountsConfig from '@/app/components/admin/sections/DiscountsConfig';
@@ -240,8 +239,9 @@ export default function SettingsPage() {
         }
     };
 
-    // Redirect if using Digicarte
-    if (USE_DIGICARTE) return null;
+    // En mode Digicarte, les paramètres sont chargés/enregistrés via /api/sql/*
+    // (getEtabConfig, updateParameters). Le garde « USE_DIGICARTE → return null »
+    // d'origine rendait la page vide.
 
     if (isLoading) {
         return (

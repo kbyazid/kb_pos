@@ -200,8 +200,9 @@ export default function StatsPage() {
         }
     }, [startDate, endDate, fetchStatistics]);
 
-    // Redirect if using Digicarte (after all hooks)
-    if (USE_DIGICARTE) return null;
+    // En mode Digicarte, les statistiques sont chargées depuis la base MySQL
+    // via /api/sql/getStatistics (voir fetchStatistics ci-dessus). Le garde
+    // « USE_DIGICARTE → return null » d'origine rendait la page vide.
 
     if (loading) {
         return (

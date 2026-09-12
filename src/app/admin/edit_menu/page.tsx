@@ -5,7 +5,6 @@ import ProductsConfig from '@/app/components/admin/sections/ProductsConfig';
 import CategoriesConfig from '@/app/components/admin/sections/CategoriesConfig';
 import { Category } from '@/app/utils/interfaces';
 import { AdminProduct } from '@/app/components/admin/sections/ProductsConfig';
-import { USE_DIGICARTE } from '@/app/utils/constants';
 import { useConfig } from '@/app/hooks/useConfig';
 import AdminPageLayout from '@/app/components/admin/AdminPageLayout';
 
@@ -174,8 +173,9 @@ export default function EditMenuPage() {
             ? currencies.map((c) => ({ label: c.symbol, value: c.label }))
             : [{ label: '€', value: 'Euro' }];
 
-    // Redirect if using Digicarte
-    if (USE_DIGICARTE) return null;
+// En mode Digicarte, cette page édite directement la base MySQL via /api/sql/*
+// (le garde « USE_DIGICARTE → return null » d'origine rendait la page vide et
+// empêchait toute édition du catalogue en base).
 
     if (isLoading) {
         return (
