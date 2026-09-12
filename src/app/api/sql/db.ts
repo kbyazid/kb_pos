@@ -1,5 +1,4 @@
 import mysql from 'mysql2/promise';
-import { POS } from '@/app/utils/constants';
 
 export type Connection = mysql.Connection;
 
@@ -16,9 +15,12 @@ export function getMainDb() {
     });
 }
 
+// Mode base unique (établissement unique) : les données « POS » (transactions,
+// paramètres, utilisateurs, imprimantes, devises, stats) vivent dans la même
+// base que le catalogue. Architecture d'origine : database: DB_NAME + '_' + POS.
 export function getPosDb() {
     return mysql.createConnection({
         ...dbConfig,
-        database: process.env.DB_NAME + '_' + POS,
+        database: process.env.DB_NAME,
     });
 }
