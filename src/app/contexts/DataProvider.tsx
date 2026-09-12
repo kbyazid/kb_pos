@@ -48,6 +48,7 @@ import {
     idbGetAllTransactionSets,
     idbRemoveTransactions,
 } from '../utils/transactionStore';
+import { isFullscreen, requestFullscreen } from '../utils/fullscreen';
 import { mergeTransactionArrays } from './dataProvider/syncUtils';
 import { isProcessingTransaction, isWaitingTransaction } from './dataProvider/transactionHelpers';
 import { useMercurial } from './dataProvider/useMercurial';
@@ -1160,6 +1161,13 @@ export const DataProvider: FC<DataProviderProps> = ({ children }) => {
             setSelectedProduct(p ?? product);
             setAmount(product.amount);
             setQuantity(product.amount ? -1 : 0);
+
+            // Plein écran automatique dès le premier produit ajouté au panier
+            // (le plein écran est autorisé car la chaîne provient d'un geste
+            // utilisateur — clic sur un produit).
+            if (products.current.length === 1 && !isFullscreen()) {
+                requestFullscreen();
+            }
         },
         [products, selectedProduct, computeQuantity]
     );
