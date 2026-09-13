@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getPosDb } from '../db';
+import { isAdminAuthed } from '@/app/utils/adminAuth';
 
 interface ParameterUpdate {
     key: string;
@@ -7,6 +8,10 @@ interface ParameterUpdate {
 }
 
 export async function POST(request: Request) {
+    if (!isAdminAuthed()) {
+        return NextResponse.json({ error: 'Non autorisé' }, { status: 401 });
+    }
+
     try {
         const { parameters } = await request.json();
 

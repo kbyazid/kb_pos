@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getMainDb } from '../db';
+import { isAdminAuthed } from '@/app/utils/adminAuth';
 
 interface Category {
     label: string;
@@ -7,6 +8,10 @@ interface Category {
 }
 
 export async function POST(request: Request) {
+    if (!isAdminAuthed()) {
+        return NextResponse.json({ error: 'Non autorisé' }, { status: 401 });
+    }
+
     try {
         const { categories } = await request.json();
 
