@@ -6,7 +6,7 @@ import AdminConfigWrapper from '@/app/components/admin/AdminConfigWrapper';
 export default async function AdminLayout({ children }: { children: ReactNode }) {
     // Protection admin : redirige vers /connexion tant que le cookie
     // de session n'est pas valide (inactif si ADMIN_PASSWORD est absent).
-    if (!isAdminAuthed()) redirect('/connexion');
+    if (!(await isAdminAuthed())) redirect('/connexion');
 
     return <AdminConfigWrapper>{children}</AdminConfigWrapper>;
 }

@@ -21,12 +21,12 @@ function sign(ts: string, password: string): string {
         .digest('hex');
 }
 
-export function isAdminAuthed(): boolean {
+export async function isAdminAuthed(): Promise<boolean> {
     const password = process.env.ADMIN_PASSWORD;
     // Pas de mot de passe configuré → accès libre (mode d'origine du dépôt)
     if (!password) return true;
 
-    const token = cookies().get(SESSION_NAME)?.value;
+    const token = (await cookies()).get(SESSION_NAME)?.value;
     if (!token) return false;
 
     const dot = token.indexOf('.');

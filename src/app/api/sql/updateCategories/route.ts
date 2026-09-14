@@ -8,7 +8,7 @@ interface Category {
 }
 
 export async function POST(request: Request) {
-    if (!isAdminAuthed()) {
+    if (!(await isAdminAuthed())) {
         return NextResponse.json({ error: 'Non autorisé' }, { status: 401 });
     }
 

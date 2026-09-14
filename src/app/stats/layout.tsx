@@ -5,7 +5,7 @@ import AdminConfigWrapper from '@/app/components/admin/AdminConfigWrapper';
 
 export default async function StatsLayout({ children }: { children: ReactNode }) {
     // Protection stats : inactif si ADMIN_PASSWORD est absent.
-    if (!isAdminAuthed()) redirect('/connexion');
+    if (!(await isAdminAuthed())) redirect('/connexion');
 
     return <AdminConfigWrapper>{children}</AdminConfigWrapper>;
 }
